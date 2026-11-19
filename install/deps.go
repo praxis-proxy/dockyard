@@ -85,6 +85,18 @@ func (d *Deps) WithBuiltImage(contextDir, tag, clusterName string, isKind bool) 
 	return d.With(BuildImage(contextDir, tag)).With(LoadImage(clusterName, tag, isKind))
 }
 
+// WithBuiltImageFrom appends a docker build with an explicit Dockerfile/Containerfile
+// path, then loads the tag into the kind cluster.
+func (d *Deps) WithBuiltImageFrom(contextDir, dockerfile, tag, clusterName string, isKind bool) *Deps {
+	return d.With(BuildImageFrom(contextDir, dockerfile, tag)).With(LoadImage(clusterName, tag, isKind))
+}
+
+// WithPulledImage appends a docker pull of a published image, then loads it into the
+// kind cluster — for public fixture images (e.g. a pinned llm-katan digest).
+func (d *Deps) WithPulledImage(image, clusterName string, isKind bool) *Deps {
+	return d.With(PullImage(image)).With(LoadImage(clusterName, image, isKind))
+}
+
 // WithRecorder appends a pull + kind-load of the published recorder sim image
 // (DefaultRecorderRegistry:DefaultRecorderTag, overridable via image), so a
 // consumer uses the recorder without building it from source. The consumer still
@@ -102,6 +114,11 @@ func RecorderImage(tag string) string {
 		tag = DefaultRecorderTag
 	}
 	return DefaultRecorderRegistry + ":" + tag
+}
+
+// WithNamespace appends an idempotent Namespace apply (create-or-reconcile labels).
+func (d *Deps) WithNamespace(name string, labels map[string]string) *Deps {
+	return d.With(EnsureNamespace(name, labels))
 }
 
 // WithManifests appends a suite-level manifest-apply step (shared infra).

@@ -25,6 +25,16 @@ func BuildImage(contextDir, tag string) env.Func {
 	}
 }
 
+// BuildImageFrom builds a container image with an explicit Dockerfile/Containerfile
+// path: `docker build -t tag -f dockerfile contextDir`. For products whose image
+// definition is not at contextDir/Dockerfile (e.g. ext-proc's Containerfile). A
+// sanctioned shell-out — building images has no pure-Go path.
+func BuildImageFrom(contextDir, dockerfile, tag string) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		return ctx, sh(ctx, cfg, "docker", "build", "-t", tag, "-f", dockerfile, contextDir)
+	}
+}
+
 // PullImage pulls a published image with `docker pull` (so a subsequent kind load
 // has it locally). A no-op the kind load tolerates if the image is already present.
 func PullImage(image string) env.Func {

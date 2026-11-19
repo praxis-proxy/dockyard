@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
@@ -20,6 +23,7 @@ import (
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
+	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 )
 
@@ -96,6 +100,148 @@ func applyYAML(ctx context.Context, cfg *envconf.Config, manifest string) error 
 		return fmt.Errorf("apply inline manifest: %w", err)
 	}
 	return nil
+}
+
+// ApplyYAMLBytes server-side-applies every document in an in-memory manifest (for
+// callers that render/transform YAML themselves, e.g. kustomize output).
+func ApplyYAMLBytes(data []byte) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		return ctx, applyYAML(ctx, cfg, string(data))
+	}
+}
+
+// ApplyYAMLBytesExcludingKinds server-side-applies every document except those whose
+// Kind is in excludeKinds (the Go equivalent of piping through `yq 'select(.kind !=
+// ...)'`). Useful for rendered bundles carrying resources a kind cluster can't honor
+// (e.g. ServiceMonitor, ValidatingWebhookConfiguration without service-ca).
+func ApplyYAMLBytesExcludingKinds(data []byte, excludeKinds ...string) env.Func {
+	skip := make(map[string]bool, len(excludeKinds))
+	for _, k := range excludeKinds {
+		skip[k] = true
+	}
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		apply := ssaHandler(r)
+		handler := func(ctx context.Context, obj k8s.Object) error {
+			if skip[obj.GetObjectKind().GroupVersionKind().Kind] {
+				return nil
+			}
+			return apply(ctx, obj)
+		}
+		if err := decoder.DecodeEach(ctx, bytes.NewReader(data), handler); err != nil {
+			return ctx, fmt.Errorf("apply filtered manifest: %w", err)
+		}
+		return ctx, nil
+	}
+}
+
+// ApplyManifestOnlyKinds server-side-applies only the documents in a file whose Kind
+// is in includeKinds (the Go equivalent of `yq 'select(.kind == ...)'`), e.g. to
+// apply just the AITenant objects from a mixed fixture file.
+func ApplyManifestOnlyKinds(path string, includeKinds ...string) env.Func {
+	keep := make(map[string]bool, len(includeKinds))
+	for _, k := range includeKinds {
+		keep[k] = true
+	}
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return ctx, err
+		}
+		defer func() { _ = f.Close() }()
+		apply := ssaHandler(r)
+		handler := func(ctx context.Context, obj k8s.Object) error {
+			if !keep[obj.GetObjectKind().GroupVersionKind().Kind] {
+				return nil
+			}
+			return apply(ctx, obj)
+		}
+		if err := decoder.DecodeEach(ctx, f, handler); err != nil {
+			return ctx, fmt.Errorf("apply %s: %w", path, err)
+		}
+		return ctx, nil
+	}
+}
+
+// AnnotateResource merge-patches annotations onto an object identified by GVK.
+func AnnotateResource(gvk schema.GroupVersionKind, namespace, name string, annotations map[string]string) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": annotations}})
+		if err != nil {
+			return ctx, err
+		}
+		obj.SetNamespace(namespace)
+		obj.SetName(name)
+		if err := r.Patch(ctx, obj, k8s.Patch{PatchType: types.MergePatchType, Data: patch}); err != nil {
+			return ctx, fmt.Errorf("annotate %s %s/%s: %w", gvk.Kind, namespace, name, err)
+		}
+		return ctx, nil
+	}
+}
+
+// WaitForAnnotation blocks until an object's annotation equals want (e.g. a
+// controller-driven status handshake).
+func WaitForAnnotation(gvk schema.GroupVersionKind, namespace, name, key, want string, timeout time.Duration) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		err = wait.For(func(ctx context.Context) (bool, error) {
+			if e := r.Get(ctx, name, namespace, obj); e != nil {
+				if apierrors.IsNotFound(e) {
+					return false, nil
+				}
+				return false, e
+			}
+			return obj.GetAnnotations()[key] == want, nil
+		}, wait.WithContext(ctx), wait.WithTimeout(timeout), wait.WithInterval(defaultWaitInterval))
+		if err != nil {
+			return ctx, fmt.Errorf("%s %s/%s annotation %s!=%q: %w", gvk.Kind, namespace, name, key, want, err)
+		}
+		return ctx, nil
+	}
+}
+
+// WaitForResource blocks until an object of the given GVK exists (e.g. a CR a
+// controller creates). namespace may be empty for cluster-scoped kinds.
+func WaitForResource(gvk schema.GroupVersionKind, namespace, name string, timeout time.Duration) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		err = wait.For(func(ctx context.Context) (bool, error) {
+			if e := r.Get(ctx, name, namespace, obj); e != nil {
+				if apierrors.IsNotFound(e) {
+					return false, nil
+				}
+				return false, e
+			}
+			return true, nil
+		}, wait.WithContext(ctx), wait.WithTimeout(timeout), wait.WithInterval(defaultWaitInterval))
+		if err != nil {
+			return ctx, fmt.Errorf("resource %s %s/%s not found: %w", gvk.Kind, namespace, name, err)
+		}
+		return ctx, nil
+	}
 }
 
 // applyFile server-side-applies every document in a manifest file on disk.
