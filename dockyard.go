@@ -1,0 +1,203 @@
+// Package dockyard is a shared, cluster-agnostic Go e2e framework: it provisions
+// a real platform (a kind cluster or an existing kubeconfig), docks a vessel
+// into it, and runs sea trials. It wraps sigs.k8s.io/e2e-framework with
+// flag-driven cluster lifecycle, a dependency-install stack, and a
+// test-suite/label system — modeled on Crossplane's test/e2e/config.
+//
+// Dockyard is L1: generic, with no vessel-specific knowledge. A consumer
+// supplies a Vessel (see vessel.go) that owns its control plane, dependency
+// stack and CRD types; Dockyard owns cluster lifecycle, suites, labels, and the
+// generic installers (package install) and feature helpers (package feature).
+package dockyard
+
+import (
+	"cmp"
+	"flag"
+	"os"
+
+	"sigs.k8s.io/e2e-framework/pkg/env"
+	"sigs.k8s.io/e2e-framework/pkg/envconf"
+	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+	"sigs.k8s.io/e2e-framework/pkg/features"
+	"sigs.k8s.io/e2e-framework/support/kind"
+)
+
+// LabelTestSuite marks which suite a Feature belongs to. Every Feature must set
+// it; TestMain's BeforeEachFeature enforces that (as in Crossplane).
+const LabelTestSuite = "test-suite"
+
+// TestSuiteDefault is the base suite key/value for LabelTestSuite.
+const TestSuiteDefault = "base"
+
+const testSuiteFlag = "test-suite"
+
+// Environment is the e2e configuration; it embeds the e2e-framework environment
+// so it IS an env.Environment with extra, domain-aware methods.
+type Environment struct {
+	env.Environment
+
+	createCluster  *bool
+	destroyCluster *bool
+	installDeps    *bool
+	clusterName    *string
+	gatewayAPIVer  *string
+	metalLBVer     *string
+
+	vessel Vessel
+
+	selected *selectedTestSuite
+	suites   map[string]testSuite
+}
+
+// selectedTestSuite implements flag.Value to distinguish unset from empty.
+type selectedTestSuite struct {
+	name string
+	set  bool
+}
+
+func (s *selectedTestSuite) String() string {
+	if !s.set {
+		return TestSuiteDefault
+	}
+	return s.name
+}
+
+func (s *selectedTestSuite) Set(v string) error {
+	s.name, s.set = v, true
+	return nil
+}
+
+// testSuite is a named set of options applied on top of the base suite.
+type testSuite struct {
+	excludeBase    bool
+	additionalFns  []conditionalSetupFunc
+	labelsToSelect features.Labels
+}
+
+// conditionalSetupFunc gates env.Funcs behind a runtime condition.
+type conditionalSetupFunc struct {
+	condition func() bool
+	fns       []env.Func
+}
+
+// NewEnvironmentFromFlags registers the flags but does not parse them (the
+// caller does, in TestMain).
+func NewEnvironmentFromFlags() Environment {
+	e := Environment{suites: map[string]testSuite{}}
+	e.createCluster = flag.Bool("create-cluster", true, "create a kind cluster before running (false: use the current kubeconfig)")
+	e.destroyCluster = flag.Bool("destroy-cluster", true, "destroy the kind cluster when tests complete")
+	e.installDeps = flag.Bool("install-deps", true, "install the vessel's dependency stack (cluster add-ons, CRDs, images, shared infra)")
+	e.clusterName = flag.String("cluster-name", "", "kind cluster name (random if empty)")
+	e.gatewayAPIVer = flag.String("gateway-api-version", cmp.Or(os.Getenv("AIGW_GATEWAY_API_VERSION"), "v1.2.1"), "Gateway API release for the CRD bundle")
+	e.metalLBVer = flag.String("metallb-version", cmp.Or(os.Getenv("AIGW_METALLB_VERSION"), "v0.14.9"), "metallb release for the LoadBalancer IP pool")
+	e.selected = &selectedTestSuite{}
+	flag.Var(e.selected, testSuiteFlag, "test suite defining environment setup and tests to run")
+	return e
+}
+
+// --- suite registration (mirrors Crossplane's Add*TestSuite + Option) --------
+
+// Option configures a testSuite.
+type Option func(*testSuite)
+
+// WithLabelsToSelect sets the labels a suite selects when chosen.
+func WithLabelsToSelect(l features.Labels) Option {
+	return func(s *testSuite) { s.labelsToSelect = l }
+}
+
+// WithAdditionalSetup adds env.Funcs run (when condition holds) if the suite is selected.
+func WithAdditionalSetup(condition func() bool, fns ...env.Func) Option {
+	return func(s *testSuite) {
+		s.additionalFns = append(s.additionalFns, conditionalSetupFunc{condition: condition, fns: fns})
+	}
+}
+
+// WithoutBaseDefaultTestSuite marks the default suite as not inheriting the base.
+func WithoutBaseDefaultTestSuite() Option {
+	return func(s *testSuite) { s.excludeBase = true }
+}
+
+// AddDefaultTestSuite registers the base suite.
+func (e *Environment) AddDefaultTestSuite(opts ...Option) {
+	e.AddTestSuite(TestSuiteDefault, opts...)
+}
+
+// AddTestSuite registers a named suite (call from a test file's init()).
+func (e *Environment) AddTestSuite(name string, opts ...Option) {
+	s := testSuite{}
+	for _, o := range opts {
+		o(&s)
+	}
+	e.suites[name] = s
+}
+
+// EnrichLabels merges the selected suite's labelsToSelect into the caller's
+// labels (user-provided values win).
+func (e *Environment) EnrichLabels(labels features.Labels) features.Labels {
+	if labels == nil {
+		labels = features.Labels{}
+	}
+	for k, v := range e.suites[e.selected.String()].labelsToSelect {
+		if _, exists := labels[k]; !exists {
+			labels[k] = v
+		}
+	}
+	return labels
+}
+
+// GetSelectedSuiteAdditionalEnvSetup returns the selected suite's conditional setup funcs.
+func (e *Environment) GetSelectedSuiteAdditionalEnvSetup() []env.Func {
+	var fns []env.Func
+	for _, c := range e.suites[e.selected.String()].additionalFns {
+		if c.condition == nil || c.condition() {
+			fns = append(fns, c.fns...)
+		}
+	}
+	return fns
+}
+
+// SetEnvironment sets the wrapped e2e-framework environment.
+func (e *Environment) SetEnvironment(inner env.Environment) { e.Environment = inner }
+
+// --- accessors ---------------------------------------------------------------
+
+func (e *Environment) IsKindCluster() bool { return *e.createCluster || *e.clusterName != "" }
+
+func (e *Environment) GetClusterName() string {
+	if !e.IsKindCluster() {
+		return ""
+	}
+	if *e.clusterName == "" {
+		name := envconf.RandomName("dockyard", 24)
+		e.clusterName = &name
+	}
+	return *e.clusterName
+}
+
+func (e *Environment) ShouldCreateCluster() bool  { return *e.createCluster }
+func (e *Environment) ShouldDestroyCluster() bool { return *e.createCluster && *e.destroyCluster }
+func (e *Environment) ShouldInstallDeps() bool    { return *e.installDeps }
+func (e *Environment) MetalLBVersion() string     { return *e.metalLBVer }
+func (e *Environment) GatewayAPIVersion() string  { return *e.gatewayAPIVer }
+
+// WithVessel sets the per-repo Vessel (control plane, deps, CRD types). Call it
+// in TestMain before setup composition.
+func (e *Environment) WithVessel(p Vessel) *Environment {
+	e.vessel = p
+	return e
+}
+
+// Vessel returns the configured Vessel.
+func (e *Environment) Vessel() Vessel { return e.vessel }
+
+// --- setup composition -------------------------------------------------------
+
+// CreateClusterFunc returns the cluster-create env.Func (kind).
+func (e *Environment) CreateClusterFunc() env.Func {
+	return envfuncs.CreateCluster(kind.NewProvider(), e.GetClusterName())
+}
+
+// DestroyClusterFunc returns the cluster-destroy env.Func.
+func (e *Environment) DestroyClusterFunc() env.Func {
+	return envfuncs.DestroyCluster(e.GetClusterName())
+}
