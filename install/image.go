@@ -43,6 +43,14 @@ func PullImage(image string) env.Func {
 	}
 }
 
+// TagImage retags a local image (`docker tag src dst`), e.g. to give a pulled
+// digest reference a plain tag kind can load.
+func TagImage(src, dst string) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		return ctx, sh(ctx, cfg, "docker", "tag", src, dst)
+	}
+}
+
 // LoadImage loads an image into the kind cluster (no-op when we don't own the
 // cluster, i.e. isKind is false).
 func LoadImage(clusterName, image string, isKind bool) env.Func {

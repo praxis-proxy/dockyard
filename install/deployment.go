@@ -7,6 +7,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 )
@@ -63,6 +65,53 @@ func SetDeploymentImagePullPolicy(namespace, name, container string, policy core
 	}, container)
 }
 
+// MountConfigMapVolume mounts a ConfigMap into a Deployment's container at mountPath
+// (volume named after the ConfigMap), idempotently — the service-ca-style CA trust a
+// gateway needs to verify serving certs. No-op if the Deployment is absent.
+func MountConfigMapVolume(namespace, deployment, container, configMap, mountPath string) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var dep appsv1.Deployment
+			if getErr := r.Get(ctx, deployment, namespace, &dep); getErr != nil {
+				return getErr
+			}
+			spec := &dep.Spec.Template.Spec
+			for i := range spec.Volumes {
+				if spec.Volumes[i].Name == configMap {
+					return nil // already mounted
+				}
+			}
+			spec.Volumes = append(spec.Volumes, corev1.Volume{
+				Name: configMap,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: configMap},
+					},
+				},
+			})
+			idx, idxErr := containerIndex(spec.Containers, container)
+			if idxErr != nil {
+				return idxErr
+			}
+			spec.Containers[idx].VolumeMounts = append(spec.Containers[idx].VolumeMounts, corev1.VolumeMount{
+				Name: configMap, MountPath: mountPath, ReadOnly: true,
+			})
+			return r.Update(ctx, &dep)
+		})
+		if apierrors.IsNotFound(err) {
+			return ctx, nil // gateway Deployment not present; nothing to mount
+		}
+		if err != nil {
+			return ctx, fmt.Errorf("mount configmap %s into %s/%s: %w", configMap, namespace, deployment, err)
+		}
+		return ctx, nil
+	}
+}
+
 // mutateDeployment gets a Deployment, applies fn to the selected container, and
 // updates it. The target container is matched by name, or the first container when
 // name is empty.
@@ -72,16 +121,20 @@ func mutateDeployment(namespace, name string, fn func(*corev1.Container), contai
 		if err != nil {
 			return ctx, err
 		}
-		var dep appsv1.Deployment
-		if err := r.Get(ctx, name, namespace, &dep); err != nil {
-			return ctx, fmt.Errorf("get deployment %s/%s: %w", namespace, name, err)
-		}
-		idx, err := containerIndex(dep.Spec.Template.Spec.Containers, container)
-		if err != nil {
-			return ctx, fmt.Errorf("deployment %s/%s: %w", namespace, name, err)
-		}
-		fn(&dep.Spec.Template.Spec.Containers[idx])
-		if err := r.Update(ctx, &dep); err != nil {
+		// Retry on conflict: a freshly-applied Deployment churns as controllers
+		// reconcile it, so a Get→modify→Update can lose the optimistic-concurrency race.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var dep appsv1.Deployment
+			if err := r.Get(ctx, name, namespace, &dep); err != nil {
+				return err
+			}
+			idx, err := containerIndex(dep.Spec.Template.Spec.Containers, container)
+			if err != nil {
+				return err
+			}
+			fn(&dep.Spec.Template.Spec.Containers[idx])
+			return r.Update(ctx, &dep)
+		}); err != nil {
 			return ctx, fmt.Errorf("update deployment %s/%s: %w", namespace, name, err)
 		}
 		return ctx, nil

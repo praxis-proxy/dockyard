@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
@@ -38,6 +40,12 @@ const defaultWaitInterval = 3 * time.Second
 // unstructured for any kind not in the scheme, so vendor manifests (CRDs and their
 // CRs) apply without registering their types.
 
+// schemeMu guards scheme registration: resources.New may hand back a shared scheme,
+// and runtime.Scheme.AddKnownTypes is not safe for concurrent writes — so parallel
+// installers (Parallel/WithParallel) that each build a client would otherwise race
+// and panic with a concurrent map write.
+var schemeMu sync.Mutex
+
 // newResources builds a resources client with the core (client-go) types
 // registered, so typed objects decode; everything else falls back to unstructured.
 func newResources(cfg *envconf.Config) (*resources.Resources, error) {
@@ -45,6 +53,8 @@ func newResources(cfg *envconf.Config) (*resources.Resources, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new resources client: %w", err)
 	}
+	schemeMu.Lock()
+	defer schemeMu.Unlock()
 	_ = clientgoscheme.AddToScheme(r.GetScheme())
 	_ = apiextensionsv1.AddToScheme(r.GetScheme())
 	return r, nil
@@ -56,6 +66,7 @@ func newResources(cfg *envconf.Config) (*resources.Resources, error) {
 // objects; already present on unstructured ones) before marshaling.
 func ssaHandler(r *resources.Resources) decoder.HandlerFunc {
 	sch := r.GetScheme()
+	cl := r.GetControllerRuntimeClient()
 	force := true
 	return func(ctx context.Context, obj k8s.Object) error {
 		if obj.GetObjectKind().GroupVersionKind().Empty() {
@@ -64,6 +75,14 @@ func ssaHandler(r *resources.Resources) decoder.HandlerFunc {
 				return fmt.Errorf("resolve GVK for %T: %w", obj, err)
 			}
 			obj.GetObjectKind().SetGroupVersionKind(gvks[0])
+		}
+		// Default a namespaced object with no namespace to "default", matching
+		// `kubectl apply -f` (which uses the context namespace) — some rendered
+		// bundles omit the namespace on namespaced resources.
+		if obj.GetNamespace() == "" {
+			if namespaced, err := cl.IsObjectNamespaced(obj); err == nil && namespaced {
+				obj.SetNamespace("default")
+			}
 		}
 		data, err := json.Marshal(obj)
 		if err != nil {
@@ -165,6 +184,66 @@ func ApplyManifestOnlyKinds(path string, includeKinds ...string) env.Func {
 		}
 		if err := decoder.DecodeEach(ctx, f, handler); err != nil {
 			return ctx, fmt.Errorf("apply %s: %w", path, err)
+		}
+		return ctx, nil
+	}
+}
+
+// ApplyManifestExcludingKinds server-side-applies every document in a file whose Kind
+// is NOT in excludeKinds (the Go equivalent of `yq 'select(.kind != ...)'`), e.g. to
+// apply a fixture file while skipping its AITenant (applied earlier).
+func ApplyManifestExcludingKinds(path string, excludeKinds ...string) env.Func {
+	skip := make(map[string]bool, len(excludeKinds))
+	for _, k := range excludeKinds {
+		skip[k] = true
+	}
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return ctx, err
+		}
+		defer func() { _ = f.Close() }()
+		apply := ssaHandler(r)
+		handler := func(ctx context.Context, obj k8s.Object) error {
+			if skip[obj.GetObjectKind().GroupVersionKind().Kind] {
+				return nil
+			}
+			return apply(ctx, obj)
+		}
+		if err := decoder.DecodeEach(ctx, f, handler); err != nil {
+			return ctx, fmt.Errorf("apply %s: %w", path, err)
+		}
+		return ctx, nil
+	}
+}
+
+// WaitForPhase blocks until an object's status.phase equals want (e.g. a MaaS
+// Subscription or ExternalModel reaching "Active"/"Ready" before dependent steps).
+func WaitForPhase(gvk schema.GroupVersionKind, namespace, name, want string, timeout time.Duration) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		var last string
+		err = wait.For(func(ctx context.Context) (bool, error) {
+			if e := r.Get(ctx, name, namespace, obj); e != nil {
+				if apierrors.IsNotFound(e) {
+					return false, nil
+				}
+				return false, e
+			}
+			last, _, _ = unstructured.NestedString(obj.Object, "status", "phase")
+			return last == want, nil
+		}, wait.WithContext(ctx), wait.WithTimeout(timeout), wait.WithInterval(defaultWaitInterval))
+		if err != nil {
+			return ctx, fmt.Errorf("%s %s/%s phase=%q, want %q: %w", gvk.Kind, namespace, name, last, want, err)
 		}
 		return ctx, nil
 	}
@@ -333,15 +412,17 @@ func waitAllDeploymentsAvailable(ctx context.Context, r *resources.Resources, ns
 // restartDeployment forces a rollout by stamping a restart annotation on the pod
 // template (the Go equivalent of `kubectl rollout restart deployment/name`).
 func restartDeployment(ctx context.Context, r *resources.Resources, ns, name string) error {
-	var dep appsv1.Deployment
-	if err := r.Get(ctx, name, ns, &dep); err != nil {
-		return fmt.Errorf("get deployment %s/%s: %w", ns, name, err)
-	}
-	if dep.Spec.Template.Annotations == nil {
-		dep.Spec.Template.Annotations = map[string]string{}
-	}
-	dep.Spec.Template.Annotations["dockyard.dev/restartedAt"] = time.Now().Format(time.RFC3339Nano)
-	if err := r.Update(ctx, &dep); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var dep appsv1.Deployment
+		if err := r.Get(ctx, name, ns, &dep); err != nil {
+			return err
+		}
+		if dep.Spec.Template.Annotations == nil {
+			dep.Spec.Template.Annotations = map[string]string{}
+		}
+		dep.Spec.Template.Annotations["dockyard.dev/restartedAt"] = time.Now().Format(time.RFC3339Nano)
+		return r.Update(ctx, &dep)
+	}); err != nil {
 		return fmt.Errorf("restart deployment %s/%s: %w", ns, name, err)
 	}
 	return nil

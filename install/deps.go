@@ -39,6 +39,11 @@ func (d *Deps) With(fn env.Func) *Deps {
 	return d
 }
 
+// WithParallel appends one stage that runs the given steps concurrently (see
+// Parallel). Use for independent steps — image loads, independent installers — to
+// cut cold-provision wall-clock. Ordered steps stay as separate With* calls.
+func (d *Deps) WithParallel(fns ...env.Func) *Deps { return d.With(Parallel(fns...)) }
+
 // WithMetalLB appends the metallb install (LoadBalancer IPs for the gateway).
 func (d *Deps) WithMetalLB(opts ...MetalLBOption) *Deps { return d.With(InstallMetalLB(opts...)) }
 
@@ -95,6 +100,13 @@ func (d *Deps) WithBuiltImageFrom(contextDir, dockerfile, tag, clusterName strin
 // kind cluster — for public fixture images (e.g. a pinned llm-katan digest).
 func (d *Deps) WithPulledImage(image, clusterName string, isKind bool) *Deps {
 	return d.With(PullImage(image)).With(LoadImage(clusterName, image, isKind))
+}
+
+// WithPulledImageAs pulls a published reference (often a digest), retags it to a
+// plain local tag, and loads that tag into kind — the pattern for a digest-pinned
+// public image kind can't load by digest (e.g. llm-katan).
+func (d *Deps) WithPulledImageAs(pullRef, localTag, clusterName string, isKind bool) *Deps {
+	return d.With(PullImage(pullRef)).With(TagImage(pullRef, localTag)).With(LoadImage(clusterName, localTag, isKind))
 }
 
 // WithRecorder appends a pull + kind-load of the published recorder sim image

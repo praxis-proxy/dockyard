@@ -117,6 +117,65 @@ func newLeaf(commonName string, dnsNames []string, validity time.Duration, paren
 	return pemBlock("CERTIFICATE", der), keyPEM, nil
 }
 
+// ServiceCAServingCertAnnotation is the OpenShift service-ca annotation naming the
+// serving-cert Secret to generate for a Service.
+const ServiceCAServingCertAnnotation = "service.beta.openshift.io/serving-cert-secret-name"
+
+// SignAnnotatedServiceCerts stands in for the OpenShift service-ca operator on a
+// cluster that lacks it (e.g. kind). It scans a namespace for Services carrying the
+// serving-cert annotation and, for each, mints a serving certificate (SANs = the
+// Service's cluster DNS) signed by ca and writes the annotated TLS Secret. It polls
+// up to timeout so Services a controller creates asynchronously are still covered,
+// returning once every annotated Service has its Secret (or the timeout elapses).
+//
+// This is the generic form of what the ext-proc data plane needs on kind: the
+// controller annotates each ExtProc Service, and this creates exactly those secrets
+// so the pods can mount them.
+func SignAnnotatedServiceCerts(ca *CA, namespace string, validity, timeout time.Duration) env.Func {
+	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+		r, err := newResources(cfg)
+		if err != nil {
+			return ctx, err
+		}
+		deadline := time.Now().Add(timeout)
+		for {
+			var services corev1.ServiceList
+			if err := r.WithNamespace(namespace).List(ctx, &services); err != nil {
+				return ctx, fmt.Errorf("list services in %s: %w", namespace, err)
+			}
+			annotated, minted := 0, 0
+			for i := range services.Items {
+				svc := &services.Items[i]
+				secretName := svc.Annotations[ServiceCAServingCertAnnotation]
+				if secretName == "" {
+					continue
+				}
+				annotated++
+				var existing corev1.Secret
+				if err := r.Get(ctx, secretName, namespace, &existing); err == nil {
+					continue // already issued
+				}
+				dns := svc.Name + "." + namespace + ".svc"
+				cert, key, signErr := ca.SignServingCert(dns, []string{dns, dns + ".cluster.local"}, validity)
+				if signErr != nil {
+					return ctx, fmt.Errorf("sign serving cert for %s/%s: %w", namespace, svc.Name, signErr)
+				}
+				if _, err := CreateTLSSecret(namespace, secretName, cert, key)(ctx, cfg); err != nil {
+					return ctx, err
+				}
+				minted++
+			}
+			if annotated > 0 && minted == 0 {
+				return ctx, nil // every annotated Service has its secret
+			}
+			if time.Now().After(deadline) {
+				return ctx, nil // best effort; late Services covered on a later call
+			}
+			time.Sleep(defaultWaitInterval)
+		}
+	}
+}
+
 // CreateTLSSecret server-side-applies a kubernetes.io/tls Secret (tls.crt/tls.key).
 func CreateTLSSecret(namespace, name string, certPEM, keyPEM []byte) env.Func {
 	return applySecret(namespace, name, corev1.SecretTypeTLS, map[string][]byte{
