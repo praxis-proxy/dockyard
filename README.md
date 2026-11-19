@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/gophers/whale.svg" alt="A Go gopher riding a whale out to sea" width="320">
+  <img src="assets/gophers/dockyard.svg" alt="A hard-hatted Go gopher riding a shipping container onto a ship" width="320">
 </p>
 
 # Dockyard
@@ -87,12 +87,3 @@ needs neither tool, and a control-plane-only vessel never touches them.
 The recorder sim is published as an image (`ghcr.io/praxis-proxy/dockyard-recorder`)
 so consumers reference it via `Deps.WithRecorder(...)` instead of building it from
 source. `WithBuiltImage` remains for a consumer's own sims.
-
-## Credits
-
-Gopher artwork in `assets/gophers/` comes from two [CC0](https://creativecommons.org/publicdomain/zero/1.0/)
-collections (public domain — no attribution required; credited here anyway):
-[MariaLetta/free-gophers-pack](https://github.com/MariaLetta/free-gophers-pack) (the
-whale header, `fishing.svg`) and [egonelbre/gophers](https://github.com/egonelbre/gophers)
-(`hugging-docker.svg`, `hiking.svg`). The Go Gopher was originally designed by
-[Renée French](https://reneefrench.blogspot.com/).
