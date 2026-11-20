@@ -1,14 +1,10 @@
-// Package dockyard is a shared, cluster-agnostic Go e2e framework: it provisions
-// a real platform (a kind cluster or an existing kubeconfig), docks a vessel
-// into it, and runs sea trials. It wraps sigs.k8s.io/e2e-framework with
-// flag-driven cluster lifecycle, a dependency-install stack, and a
-// test-suite/label system — modeled on Crossplane's test/e2e/config.
-//
-// Dockyard is L1: generic, with no vessel-specific knowledge. A consumer
-// supplies a Vessel (see vessel.go) that owns its control plane, dependency
-// stack and CRD types; Dockyard owns cluster lifecycle, suites, labels, and the
-// generic installers (package install) and feature helpers (package feature).
-package dockyard
+// Package config holds the shared e2e Environment: flag-driven cluster lifecycle
+// plus a test-suite/label system over sigs.k8s.io/e2e-framework, modeled on
+// Crossplane's test/e2e/config. It is generic and product-agnostic — a consumer's
+// TestMain builds an Environment, registers suites, and composes setup from the
+// reusable helpers in package funcs; the consumer owns its control plane, CRD
+// types and dependency stack directly (no framework-level seam).
+package config
 
 import (
 	"cmp"
@@ -42,8 +38,6 @@ type Environment struct {
 	clusterName    *string
 	gatewayAPIVer  *string
 	metalLBVer     *string
-
-	vessel Vessel
 
 	selected *selectedTestSuite
 	suites   map[string]testSuite
@@ -86,7 +80,7 @@ func NewEnvironmentFromFlags() Environment {
 	e := Environment{suites: map[string]testSuite{}}
 	e.createCluster = flag.Bool("create-cluster", true, "create a kind cluster before running (false: use the current kubeconfig)")
 	e.destroyCluster = flag.Bool("destroy-cluster", true, "destroy the kind cluster when tests complete")
-	e.installDeps = flag.Bool("install-deps", true, "install the vessel's dependency stack (cluster add-ons, CRDs, images, shared infra)")
+	e.installDeps = flag.Bool("install-deps", true, "install the dependency stack (cluster add-ons, CRDs, images, shared infra)")
 	e.clusterName = flag.String("cluster-name", "", "kind cluster name (random if empty)")
 	e.gatewayAPIVer = flag.String("gateway-api-version", cmp.Or(os.Getenv("AIGW_GATEWAY_API_VERSION"), "v1.2.1"), "Gateway API release for the CRD bundle")
 	e.metalLBVer = flag.String("metallb-version", cmp.Or(os.Getenv("AIGW_METALLB_VERSION"), "v0.14.9"), "metallb release for the LoadBalancer IP pool")
@@ -179,16 +173,6 @@ func (e *Environment) ShouldDestroyCluster() bool { return *e.createCluster && *
 func (e *Environment) ShouldInstallDeps() bool    { return *e.installDeps }
 func (e *Environment) MetalLBVersion() string     { return *e.metalLBVer }
 func (e *Environment) GatewayAPIVersion() string  { return *e.gatewayAPIVer }
-
-// WithVessel sets the per-repo Vessel (control plane, deps, CRD types). Call it
-// in TestMain before setup composition.
-func (e *Environment) WithVessel(p Vessel) *Environment {
-	e.vessel = p
-	return e
-}
-
-// Vessel returns the configured Vessel.
-func (e *Environment) Vessel() Vessel { return e.vessel }
 
 // --- setup composition -------------------------------------------------------
 

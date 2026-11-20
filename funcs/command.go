@@ -1,7 +1,8 @@
-// Package install is the generic (L1) dependency-install library: env.Func
-// builders for cluster add-ons (metallb, Gateway API, istio, cert-manager,
-// kuadrant), CRD apply + waits, image build/load, and the Deps builder a Vessel
-// composes in its InstallDeps.
+// Package funcs is the generic, reusable helper library: env.Func and
+// features.Func builders a consumer composes in its TestMain and tests. It holds
+// the dependency installers for cluster add-ons (metallb, Gateway API, istio,
+// cert-manager, kuadrant), CRD apply + waits, image build/load, the Deps builder,
+// per-test waits, port-forwarding, pod exec/logs, and in-process cert minting.
 //
 // Manifest apply and readiness waits are pure Go against the API server (klient
 // decoder + resources client, server-side apply) — no kubectl binary — and both
@@ -9,9 +10,9 @@
 // SDK, so there is no helm or istioctl binary either. The only shell-outs left are
 // docker and kind, for building and loading images (no practical in-process Go
 // path). The Helm and Script delegation primitives let a consumer stand up a
-// product's own installer without L1 re-encoding it (the "full platform" escape
-// hatch).
-package install
+// product's own installer without the framework re-encoding it (the "full
+// platform" escape hatch).
+package funcs
 
 import (
 	"context"

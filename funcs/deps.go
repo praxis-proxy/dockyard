@@ -1,4 +1,4 @@
-package install
+package funcs
 
 import (
 	"time"
@@ -7,27 +7,25 @@ import (
 )
 
 // Deps builds the ordered dependency stack a product installs before its tests
-// run (the vessel's fitting-out). Each With* appends one install step from the
-// generic installers in this package; Build returns them in call order. This is
-// the builder the Vessel's InstallDeps composes — the generic layer owns the
-// building blocks, the product owns the order (e.g. the GIE CRD must land before
-// istio):
+// run. Each With* appends one install step from the generic installers in this
+// package; Build returns them in call order. The generic layer owns the building
+// blocks, the consumer owns the order (e.g. the GIE CRD must land before istio):
 //
-//	install.NewDeps().
-//	    WithMetalLB(install.MetalLBVersion(v)).
-//	    WithGatewayAPI(install.GatewayAPIVersion(v)).
+//	funcs.NewDeps().
+//	    WithMetalLB(funcs.MetalLBVersion(v)).
+//	    WithGatewayAPI(funcs.GatewayAPIVersion(v)).
 //	    WithCRDs("manifests/gie").
-//	    WithIstio(install.IstioInferenceExtension(true)).
+//	    WithIstio(funcs.IstioInferenceExtension(true)).
 //	    WithImage(clusterName, image, isKind).
 //	    WithManifests("manifests/backends", "*.yaml").
 //	    WithDeploymentAvailable("llm", "internal-model", 3*time.Minute).
 //	    Build()
 //
 // For a product with its own installer (a deploy.sh, a helm chart, operators), use
-// the delegation methods (WithHelm/WithScript/WithManifest) so L1 does
+// the delegation methods (WithHelm/WithScript/WithManifest) so the framework does
 // not re-encode the deploy. A consumer picks per chain: lightweight (Dockyard
 // installs infra + an in-process controller) vs full platform (the product's own
-// installer stands everything up; Dockyard just drives trials).
+// installer stands everything up; Dockyard just drives the tests).
 type Deps struct{ fns []env.Func }
 
 // NewDeps starts an empty dependency stack.

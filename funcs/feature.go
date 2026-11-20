@@ -1,9 +1,8 @@
-// Package feature contains the reusable per-test fixture library, modeled on
-// Crossplane's test/e2e/funcs: features.Func builders for per-test actions
-// (apply/create/delete fixtures, waits, resolving a gateway client). Suite-level
-// env.Func builders (dependency installs, CRD apply, image load) live in the
-// sibling install package.
-package feature
+// This file holds the per-test fixture helpers (modeled on Crossplane's
+// test/e2e/funcs): features.Func builders for per-test actions — apply/create/delete
+// fixtures, waits, resolving a gateway client. The suite-level env.Func installers
+// live alongside them in this package. See command.go for the package doc.
+package funcs
 
 import (
 	"context"
