@@ -59,14 +59,9 @@ func InstallCertManager(opts ...CertManagerOption) env.Func {
 // Issuer/Certificate writes). Path is relative to the test package working directory.
 func ApplyManifestFile(path string) env.Func {
 	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-		var lastErr error
-		for range 6 {
-			if lastErr = applyFile(ctx, cfg, path); lastErr == nil {
-				return ctx, nil
-			}
-			time.Sleep(10 * time.Second)
-		}
-		return ctx, fmt.Errorf("apply %s: %w", path, lastErr)
+		return ctx, Retry(ctx, time.Minute, 10*time.Second, "apply "+path, func(ctx context.Context) error {
+			return applyFile(ctx, cfg, path)
+		})
 	}
 }
 

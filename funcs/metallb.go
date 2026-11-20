@@ -81,13 +81,9 @@ apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
 metadata: {name: e2e-l2, namespace: metallb-system}
 `, addresses)
-		var lastErr error
-		for range 6 { // the validating webhook can lag the controller
-			if lastErr = applyYAML(ctx, cfg, pool); lastErr == nil {
-				return ctx, nil
-			}
-			time.Sleep(10 * time.Second)
-		}
-		return ctx, fmt.Errorf("configure metallb pool: %w", lastErr)
+		// The validating webhook can lag the controller; retry the pool apply.
+		return ctx, Retry(ctx, time.Minute, 10*time.Second, "configure metallb pool", func(ctx context.Context) error {
+			return applyYAML(ctx, cfg, pool)
+		})
 	}
 }
