@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -134,26 +135,9 @@ func ApplyYAMLBytes(data []byte) env.Func {
 // ...)'`). Useful for rendered bundles carrying resources a kind cluster can't honor
 // (e.g. ServiceMonitor, ValidatingWebhookConfiguration without service-ca).
 func ApplyYAMLBytesExcludingKinds(data []byte, excludeKinds ...string) env.Func {
-	skip := make(map[string]bool, len(excludeKinds))
-	for _, k := range excludeKinds {
-		skip[k] = true
-	}
+	keep := kindMatcher(excludeKinds, false)
 	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-		r, err := newResources(cfg)
-		if err != nil {
-			return ctx, err
-		}
-		apply := ssaHandler(r)
-		handler := func(ctx context.Context, obj k8s.Object) error {
-			if skip[obj.GetObjectKind().GroupVersionKind().Kind] {
-				return nil
-			}
-			return apply(ctx, obj)
-		}
-		if err := decoder.DecodeEach(ctx, bytes.NewReader(data), handler); err != nil {
-			return ctx, fmt.Errorf("apply filtered manifest: %w", err)
-		}
-		return ctx, nil
+		return ctx, applyFilteredDocs(ctx, cfg, bytes.NewReader(data), keep, "filtered manifest")
 	}
 }
 
@@ -161,31 +145,9 @@ func ApplyYAMLBytesExcludingKinds(data []byte, excludeKinds ...string) env.Func 
 // is in includeKinds (the Go equivalent of `yq 'select(.kind == ...)'`), e.g. to
 // apply just the AITenant objects from a mixed fixture file.
 func ApplyManifestOnlyKinds(path string, includeKinds ...string) env.Func {
-	keep := make(map[string]bool, len(includeKinds))
-	for _, k := range includeKinds {
-		keep[k] = true
-	}
+	keep := kindMatcher(includeKinds, true)
 	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-		r, err := newResources(cfg)
-		if err != nil {
-			return ctx, err
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return ctx, err
-		}
-		defer func() { _ = f.Close() }()
-		apply := ssaHandler(r)
-		handler := func(ctx context.Context, obj k8s.Object) error {
-			if !keep[obj.GetObjectKind().GroupVersionKind().Kind] {
-				return nil
-			}
-			return apply(ctx, obj)
-		}
-		if err := decoder.DecodeEach(ctx, f, handler); err != nil {
-			return ctx, fmt.Errorf("apply %s: %w", path, err)
-		}
-		return ctx, nil
+		return ctx, applyManifestFiltered(ctx, cfg, path, keep)
 	}
 }
 
@@ -193,32 +155,51 @@ func ApplyManifestOnlyKinds(path string, includeKinds ...string) env.Func {
 // is NOT in excludeKinds (the Go equivalent of `yq 'select(.kind != ...)'`), e.g. to
 // apply a fixture file while skipping its AITenant (applied earlier).
 func ApplyManifestExcludingKinds(path string, excludeKinds ...string) env.Func {
-	skip := make(map[string]bool, len(excludeKinds))
-	for _, k := range excludeKinds {
-		skip[k] = true
-	}
+	keep := kindMatcher(excludeKinds, false)
 	return func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-		r, err := newResources(cfg)
-		if err != nil {
-			return ctx, err
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return ctx, err
-		}
-		defer func() { _ = f.Close() }()
-		apply := ssaHandler(r)
-		handler := func(ctx context.Context, obj k8s.Object) error {
-			if skip[obj.GetObjectKind().GroupVersionKind().Kind] {
-				return nil
-			}
-			return apply(ctx, obj)
-		}
-		if err := decoder.DecodeEach(ctx, f, handler); err != nil {
-			return ctx, fmt.Errorf("apply %s: %w", path, err)
-		}
-		return ctx, nil
+		return ctx, applyManifestFiltered(ctx, cfg, path, keep)
 	}
+}
+
+// kindMatcher returns a predicate over an object's Kind. With include=true it keeps only
+// kinds in the set (an OnlyKinds filter); with include=false it keeps every kind except
+// those in the set (an ExcludingKinds filter).
+func kindMatcher(kinds []string, include bool) func(kind string) bool {
+	set := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		set[k] = true
+	}
+	return func(kind string) bool { return set[kind] == include }
+}
+
+// applyManifestFiltered opens a manifest file and SSA-applies the documents matching keep.
+func applyManifestFiltered(ctx context.Context, cfg *envconf.Config, path string, keep func(kind string) bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	return applyFilteredDocs(ctx, cfg, f, keep, path)
+}
+
+// applyFilteredDocs decodes every YAML document from r and server-side-applies those whose
+// Kind passes keep. what names the source for error wrapping.
+func applyFilteredDocs(ctx context.Context, cfg *envconf.Config, r io.Reader, keep func(kind string) bool, what string) error {
+	res, err := newResources(cfg)
+	if err != nil {
+		return err
+	}
+	apply := ssaHandler(res)
+	handler := func(ctx context.Context, obj k8s.Object) error {
+		if !keep(obj.GetObjectKind().GroupVersionKind().Kind) {
+			return nil
+		}
+		return apply(ctx, obj)
+	}
+	if err := decoder.DecodeEach(ctx, r, handler); err != nil {
+		return fmt.Errorf("apply %s: %w", what, err)
+	}
+	return nil
 }
 
 // WaitForPhase blocks until an object's status.phase equals want (e.g. a MaaS
