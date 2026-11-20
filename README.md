@@ -48,8 +48,9 @@ compose setup from `env.CreateClusterFunc()`, `env.Vessel().InstallDeps(&env)`,
 |----------------|---------------------------------------------------------------------|
 | `dockyard`     | `Environment`, the `Vessel` seam, suites, labels, cluster lifecycle |
 | `install`      | Generic installers (metallb, Gateway API, istio, cert-manager, kuadrant), CRD/image/manifest steps, delegation primitives (`Helm`/`Script`/`Manifest`), and the `Deps` builder |
-| `feature`      | Per-test `features.Func` helpers (apply/create/delete, waits, `GatewayClient`) |
+| `feature`      | Per-test `features.Func` helpers (apply/create/delete, waits, port-forward, pod exec/logs, `GatewayClient`) |
 | `gateway`      | A thin HTTP SDK for OpenAI-compatible gateway endpoints              |
+| `stats`        | Dependency-free statistics for trials (Pearson chi-square goodness-of-fit for weighted-routing) |
 | `sim/recorder` | A self-identifying sim backend (own module; published as an image)   |
 
 ## Two modes
